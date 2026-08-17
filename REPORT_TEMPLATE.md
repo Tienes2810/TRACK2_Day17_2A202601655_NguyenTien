@@ -4,18 +4,40 @@
 
 ---
 
+## Tech stack và vì sao chọn từng thành phần
+
+Lab mô phỏng đường ống **Bronze → Silver → Gold** của nền tảng AI hỗ trợ khách hàng. Hạ tầng được rút gọn (không Docker, không cloud) nhưng giữ nguyên khái niệm vận hành: CDC, offset, contract, incremental transform, late data, idempotent write.
+
+| Tầng | Công nghệ | Vai trò trong lab | Vì sao dùng cái này, không dùng cái khác |
+|---|---|---|---|
+| Kho dữ liệu | **DuckDB** | Warehouse local: Bronze/Silver/Gold, đọc/ghi Parquet, `MERGE`, `INSERT ON CONFLICT` | DuckDB là OLAP in-process, đủ để tái hiện hành vi của Snowflake/BigQuery (incremental merge, predicate pushdown trên Parquet) mà không cần tài khoản cloud. OLTP (Postgres) không phù hợp cho aggregate Gold và quét Parquet. |
+| Transform | **dbt-duckdb** | Mỗi file `.sql` = một model; `ref()` tạo lineage; `config()` quyết định cách ghi | dbt tách *logic nghiệp vụ* khỏi *cách materialize*. Lỗi lab nằm ở `incremental` / `unique_key` / `contract` — đúng bề mặt mà data engineer dùng trên production. Script SQL thuần không có contract, test runner, hay `is_incremental()`. |
+| Điều phối | **Airflow DAG** (chỉ đọc bằng AST, không chạy) | `catchup`, `max_active_runs` — hệ quả của Clear Task | Phiếu #1041 là sự cố scheduler. Sửa model mới hết nhân bản; sửa DAG chỉ giảm tần suất kích hoạt lỗi khi retry/backfill. |
+| Nguồn Bronze | JSONL giả lập **Postgres CDC / S3 / Kafka** | `tickets_cdc.jsonl` (`op = c/u/d`), `transcripts.jsonl`, `events.jsonl` + commit log trên đĩa | Giữ đúng semantics (CDC update, object storage, offset tách khỏi ghi) mà không dựng Kafka/Postgres. |
+| Bài A | **Parquet + Hive partitioning** | Layout đĩa cho dashboard | Parquet không có B-tree index. Thứ duy nhất engine dùng để bỏ file/row-group là *đường dẫn partition* và *min/max stats*. Index SQL không giải quyết small-file problem. |
+| Bài B | **Commit log + offset file** (`ingest/log_client.py`) | Kafka-lite: `poll()` / `commit()` | Exactly-once không tồn tại ở tầng vận chuyển. Lab buộc chọn at-least-once + ghi idempotent — đúng trade-off của consumer thật. |
+
+**Hai chiến lược incremental dùng trong lab — không thể hoán đổi:**
+
+| Model | Grain | Strategy | Vì sao |
+|---|---|---|---|
+| `gold_training_set` | 1 hàng / 1 **entity** `ticket_id` | **`merge`** theo `ticket_id` | CDC có `op='u'`: ticket tạo ngày D1, sửa ngày D2 đi qua *hai partition ngày* trong cùng một lượt. `delete+insert` theo ngày chỉ xoá partition đang chạy, không cập nhật bản ghi entity đã nằm ở ngày khác. `append` thì nhân bản. `merge` upsert đúng khoá tự nhiên. |
+| `gold_feature_daily` | 1 hàng / cặp **`(event_date, customer_id)`** | **`delete+insert`** theo 2 cột | Đây là bảng *aggregate theo ngày*. Khi lookback tính lại ngày cũ, cả hàng aggregate phải được thay nguyên. Xoá các key trong cửa sổ rồi insert lại rẻ và đúng hơn merge từng cột. |
+
+---
+
 ## 0 · Kết quả `make verify`
 
 <details open>
-<summary>Output ba lần chạy của make verify</summary>
+<summary>Output ba lần chạy của make verify (chạy lại 2026-08-17)</summary>
 
 ```
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   LAB 17 · make verify
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  run 1/3 … 16.7s
-  run 2/3 … 16.7s
-  run 3/3 … 16.6s
+  run 1/3 … 17.5s
+  run 2/3 … 17.2s
+  run 3/3 … 17.3s
 
   BẢNG                  ỔN ĐỊNH          SỐ HÀNG     KỲ VỌNG   GHI CHÚ
   ──────────────────────────────────────────────────────────────────────────
@@ -54,7 +76,7 @@
 
 </details>
 
-Tổng kết: **4 / 4 tiêu chí đạt** (100% Pass mọi bài kiểm tra chính và bài mở rộng)
+Tổng kết: **4 / 4 tiêu chí đạt**. Extra B (`make crash-test`) chạy riêng: **ĐẠT** (20.000 / 20.000, không mất, không trùng).
 
 ---
 
@@ -62,10 +84,22 @@ Tổng kết: **4 / 4 tiêu chí đạt** (100% Pass mọi bài kiểm tra chín
 
 | | |
 |---|---|
-| **Triệu chứng** | Khi chạy lại pipeline (hoặc khi clear task trên Airflow), số hàng trong bảng `gold_training_set` tăng lên sau mỗi lượt chạy (từ 12,480 lên 25,615 rồi 38,750 hàng), `make verify` báo `FAIL` cột ỔN ĐỊNH và xuất hiện nhiều ticket bị lặp lại. |
-| **Nguyên nhân** | Model `gold_training_set` được khai báo `materialized='incremental'` nhưng thiếu `unique_key` và `incremental_strategy`. Khi không có `unique_key`, dbt tự động sinh ra câu lệnh `INSERT INTO` (append-only) thay vì `MERGE` / `DELETE+INSERT`. Do đó, khi chạy lại cùng một ngày hoặc khi một ticket có nhiều bản ghi cập nhật CDC (`op='u'`) rơi vào các ngày khác nhau, các bản ghi cũ không được thay thế mà bị chèn thêm dòng mới vào bảng đích. Ngoài ra, Airflow DAG thiết lập `catchup=True` và không giới hạn `max_active_runs` khiến nhiều luồng chạy bù cùng lúc, nhân bản dữ liệu hàng loạt. |
-| **Cách khắc phục** | - `dbt/models/gold/gold_training_set.sql`: Thêm `unique_key = 'ticket_id'` và `incremental_strategy = 'merge'` trong khối `config()`.<br>- `dags/ai_training_pipeline.py`: Cấu hình `catchup=False` và `max_active_runs=1` để ngăn chặn việc chạy bù tự động ngoài kiểm soát và hạn chế chạy đồng thời nhiều pipeline vào cùng một kho dữ liệu. |
-| **Bằng chứng** | trước: 38,750 hàng (12,480 ticket bị lặp) · sau: 12,480 hàng (1 hàng / 1 ticket, không lặp) · checksum 3 lượt: `8dd7c98653` (ổn định tuyệt đối). |
+| **Triệu chứng** | Clear Task / chạy lại pipeline: `gold_training_set` phình ra (12.480 → 25.615 → 38.750), cột ỔN ĐỊNH ✗, nhiều `ticket_id` lặp. |
+| **Nguyên nhân** | Model `incremental` **không khai `unique_key`**. dbt khi đó sinh `INSERT` append-only. Retry cùng partition = ghi *thêm* hàng, không ghi *đè*. CDC `op='u'` (1.310 bản ghi) làm cùng một ticket đi qua `WHERE run_date` nhiều lần → nhân bản ngay trong một lượt. `catchup=True` + `max_active_runs` không giới hạn chỉ *làm lỗi xảy ra dày hơn* khi Clear Task; chúng không phải root cause. |
+| **Cách khắc phục** | `gold_training_set.sql`: `unique_key='ticket_id'`, `incremental_strategy='merge'`. DAG: `catchup=False`, `max_active_runs=1`. |
+| **Vì sao dùng `merge` + `ticket_id`** | Grain là **entity** (1 ticket = 1 hàng training). Khoá tự nhiên là `ticket_id`, không phải ngày. `append` nhân bản; `delete+insert` theo ngày bỏ sót update xuyên partition. `merge` upsert đúng bản ghi mới nhất. DAG chỉ là lớp bảo vệ scheduler, không thay được ghi idempotent ở model. |
+
+**Evidence**
+
+| Chỉ số | Trước sửa | Sau sửa | Nguồn |
+|---|---|---|---|
+| Số hàng `gold_training_set` | 38.750 (thừa 26.270) | **12.480** = expected | `make verify`, `expected/gold_training_set.count` |
+| Ticket bị lặp | 12.480 | **0** (1 hàng / 1 ticket) | dòng kiểm tra `gold_training_set: 1 hàng / 1 ticket` |
+| Checksum 3 lượt | khác nhau (ỔN ĐỊNH ✗) | `8dd7c98653` × 3 | bảng CHECKSUM |
+| DAG `catchup` / `max_active_runs` | `True` / `None` | **`False` / `1`** | `tools/check_dag.py` đọc AST |
+| `gold_doc_chunks` (đối chứng) | 31.200, ổn định | 31.200, `92d8e50131` × 3 | chứng minh sửa merge không phá model khác |
+
+CDC nguồn đo được: 14.300 bản ghi (`c=12.735`, `u=1.310`, `d=255`) — đúng loại dữ liệu buộc phải `merge` theo entity, không append.
 
 ---
 
@@ -73,16 +107,34 @@ Tổng kết: **4 / 4 tiêu chí đạt** (100% Pass mọi bài kiểm tra chín
 
 | | |
 |---|---|
-| **Triệu chứng** | Bảng `gold_feature_daily` bị thiếu khoảng 5% số dòng (chỉ có 8,645 hàng thay vì 9,100 hàng kỳ vọng). Sự thiếu hụt chỉ xảy ra ở các ngày trong quá khứ, trong khi ngày mới nhất thì đầy đủ. |
-| **P99 độ trễ đo được** | **2.73 ngày** (chính xác: 2.7258 ngày, tương đương ~65.4 giờ) |
-| **Lookback đã chọn** | **3 ngày** — vì phân bố độ trễ đến kho (`_ingested_at - event_time`) có 2 cụm rõ rệt: cụm bình thường (0-6 giờ) và cụm đến muộn (43-71 giờ). P99 đo được là 2.73 ngày và độ trễ tối đa (max) là 2.94 ngày. Cửa sổ lookback 3 ngày bao phủ 100% các sự kiện đến muộn trong toàn bộ hệ thống. |
-| **Nguyên nhân** | Model `gold_feature_daily` sử dụng điều kiện lọc tăng dần `where event_date > (select max(event_date) from {{ this }})`. Khi một sự kiện xảy ra ngày D1 (ví dụ 08-12) nhưng bị trễ và chỉ tới kho vào ngày D2 (ví dụ 08-15), tại lượt chạy ngày 08-15 thì `max(event_date)` trong bảng đích đã là 08-14, khiến sự kiện ngày 08-12 không thỏa mãn điều kiện `event_date > max(event_date)` và bị bỏ qua vĩnh viễn. |
-| **Cách khắc phục** | - `dbt/models/gold/gold_feature_daily.sql`: Mở rộng cửa sổ tính lại (lookback window) trong khối `is_incremental()` thành `where event_date >= (select max(event_date) from {{ this }}) - interval 3 day`.<br>- Bổ sung vào `config()` khóa chính tổng hợp `unique_key = ['event_date', 'customer_id']` và `incremental_strategy = 'delete+insert'` để đảm bảo tính idempotent khi tính lại các ngày cũ mà không bị nhân bản dòng. |
-| **Bằng chứng** | trước: 8,645 hàng (thiếu 455 hàng) · sau: 9,100 hàng (đạt 100% kỳ vọng: 14 ngày × 650 khách hàng = 9,100 hàng) · checksum 3 lượt: `3db448685c` (ổn định). |
+| **Triệu chứng** | `gold_feature_daily` thiếu ~5% (8.645 / 9.100). Thiếu ở ngày cũ; ngày mới đủ. |
+| **P99 độ trễ đo được** | **2.7258 ngày** (~65,4 giờ) |
+| **Lookback đã chọn** | **3 ngày** — P99 = 2,73 và max = 2,94 nên `interval 3 day` phủ 100% late data của dataset này. |
+| **Nguyên nhân** | `where event_date > max(event_date)` chỉ nhận *ngày mới hơn watermark*. Event xảy ra 08-12 nhưng tới kho 08-15: lúc chạy 08-15 watermark đã là 08-14 → hàng 08-12 bị bỏ *vĩnh viễn*. Đổi `>` thành `>=` chỉ nới thêm 1 ngày, không đủ với P99 ≈ 2,7 ngày. |
+| **Cách khắc phục** | Lookback `event_date >= max(event_date) - interval 3 day`. `unique_key=['event_date','customer_id']` + `delete+insert` để tính lại không nhân bản. |
+| **Vì sao lookback 3 ngày + `delete+insert`** | Cửa sổ phải theo **P99 đo được**, không theo cảm tính. `delete+insert` vì grain là aggregate `(ngày, khách)`: tính lại một ngày phải *thay cả hàng*, không merge từng metric. Nếu chỉ nới window mà giữ `append` thì tái tạo đúng lỗi nhiệm vụ 1 trên bảng khác. |
 
-Vì sao chọn P99 làm căn cứ thay vì `max`? Chi phí của mỗi lựa chọn là gì?
+**Evidence — phân bố độ trễ** (`bronze_events`, `_ingested_at - event_time`)
 
-> Trong thiết kế Data Pipeline thực tế, độ trễ tối đa (`max`) thường bị chi phối bởi các trường hợp ngoại lệ cực đoan (outliers - ví dụ: node IoT mất kết nối mạng nhiều tuần, server ngắt nguồn lâu ngày). Nếu chọn `max` làm lookback window cố định, toàn bộ pipeline hàng ngày sẽ phải quét lại và tính toán lại một lượng dữ liệu lịch sử khổng lồ (kéo dài thời gian chạy, tốn chi phí I/O, compute và làm trễ SLA hàng ngày cho 99.9% trường hợp thông thường chỉ để đón vài bản ghi hiếm hoi). Lựa chọn **P99** đảm bảo cân bằng tối ưu giữa **tính toàn vẹn dữ liệu** (phục hồi >99% dữ liệu đến trễ) và **chi phí tài nguyên**. Phần nhỏ dữ liệu trễ vượt P99 (<1%) sẽ được xử lý bằng batch đối soát định kỳ (weekly/monthly reconciliation batch) thay vì gánh nặng hàng ngày.
+| Mốc | Giá trị đo |
+|---|---|
+| P50 | 0,1281 ngày (~3,1 giờ) — cụm đúng hạn |
+| P95 | 1,8137 ngày |
+| **P99** | **2,7258 ngày** |
+| max | 2,9447 ngày |
+| Tỷ lệ tới muộn > 1 ngày | 5,05% ≈ đúng phần hàng bị thiếu (455 / 9.100) |
+
+Hai cụm tách: 0–6 giờ (đúng hạn) và 43–71 giờ (late). Lookback 3 ngày phủ max 2,94 ngày trên *dataset này*.
+
+**Evidence — số hàng**
+
+| Chỉ số | Trước | Sau |
+|---|---|---|
+| `gold_feature_daily` | 8.645 (thiếu 455) | **9.100** = 14 ngày × 650 khách |
+| Checksum 3 lượt | ổn định nhưng *sai* | `3db448685c` × 3 và đúng số hàng |
+| `gold_training_set` (không được phá) | 12.480 | vẫn 12.480, `8dd7c98653` |
+
+Vì sao căn P99 chứ không neo cứng `max` trên production? `max` bị outlier (mất mạng nhiều tuần) kéo lookback vô hạn → mỗi run ngày nào cũng quét lại lịch sử, trả phí I/O/compute cho 99% traffic vốn đã đúng hạn. P99 cân bằng coverage và chi phí; phần <1% còn lại để reconciliation định kỳ. *Trong lab này* max chỉ 2,94 ngày nên 3 ngày vừa khớp P99 vừa phủ max — không phải lúc nào cũng trùng như vậy.
 
 ---
 
@@ -90,34 +142,77 @@ Vì sao chọn P99 làm căn cứ thay vì `max`? Chi phí của mỗi lựa ch�
 
 | | |
 |---|---|
-| **Triệu chứng** | Từ ngày 08-10, backend thay đổi format cột `priority` từ số sang chuỗi. Pipeline chạy không báo lỗi nhưng model AI phân loại dự đoán sai lệch do cột `priority` trong `silver_tickets` chứa nhiều giá trị `NULL` hoặc số ngoài phạm vi 1..4 (6,606 hàng sai), trong khi bảng `quarantine_tickets` rỗng (0 / 312). |
-| **Nguyên nhân** | 1. Sử dụng `try_cast(priority_raw as integer)` đơn thuần khiến toàn bộ nhãn chuỗi hợp lệ ('urgent', 'high', 'medium', 'low') bị ép kiểu thành `NULL` (mất dữ liệu nghiệp vụ), đồng thời lại chấp nhận các giá trị số không hợp lệ như `0, 5, -1`.<br>2. Bảng `silver_tickets` chưa bật `contract: enforced: true` và chưa có bài test kiểm tra miền giá trị 1..4.<br>3. Thứ tự xử lý trong Silver nếu lọc sau `row_number()` sẽ loại bỏ toàn bộ ticket có bản ghi mới nhất bị lỗi thay vì chỉ loại bỏ bản ghi CDC lỗi đó. |
-| **Ba nhóm giá trị `priority` và cách xử lý từng nhóm** | **1. Số hợp lệ (`'1'`, `'2'`, `'3'`, `'4'` - 6,846 bản ghi):** Đúng contract ban đầu $\rightarrow$ Ép kiểu giữ nguyên giá trị integer 1..4.<br>**2. Nhãn chuỗi (`'urgent'`, `'high'`, `'medium'`, `'low'` - 7,142 bản ghi):** Schema evolution từ backend, ý nghĩa không đổi $\rightarrow$ Ánh xạ (Map) về số nguyên tương ứng: `urgent -> 1`, `high -> 2`, `medium -> 3`, `low -> 4`.<br>**3. Dữ liệu lỗi (`'0'`, `'5'`, `'-1'`, `'P1'`, `'P2'`, `'unknown'`, `''`, `NULL` - 312 bản ghi):** Dữ liệu hỏng thật sự $\rightarrow$ Trả về `NULL` trong macro chuẩn hóa để cách ly vào `quarantine_tickets`. |
-| **Cách khắc phục** | - `dbt/macros/normalize_priority.sql`: Dùng khối `CASE` xử lý trọn vẹn 3 nhóm trên, trả về `NULL` cho nhóm lỗi; macro `priority_reject_reason` phân loại rõ nguyên nhân cách ly.<br>- `dbt/models/silver/silver_tickets.sql`: Lọc bỏ bản ghi lỗi (`priority_clean is not null`) **trước khi** đánh số `row_number()`, giúp giữ lại trạng thái hợp lệ trước đó của ticket.<br>- `dbt/models/silver/quarantine_tickets.sql`: Đặt `where {{ normalize_priority('priority_raw') }} is null` để tiếp nhận các bản ghi CDC vi phạm.<br>- `dbt/models/silver/schema.yml`: Bật `contract: enforced: true` và bổ sung test `not_null`, `accepted_values: [1, 2, 3, 4]`. |
-| **Bằng chứng** | `quarantine_tickets` = 312 hàng (khớp chính xác 312/312) · `silver_tickets` giữ đủ 12,480 ticket · `silver_tickets.priority ∈ 1..4, không NULL` sạch 100% · `dbt test` 11/11 pass (thêm 2 test mới). |
+| **Triệu chứng** | Từ 08-10 backend đổi `priority` số → chuỗi. Pipeline không dừng. Classifier kém. `silver_tickets` có 6.606 hàng sai (NULL / ngoài 1..4). `quarantine_tickets` = 0 / 312. |
+| **Nguyên nhân** | `try_cast` sai hai hướng: nhãn hợp lệ `urgent/high/medium/low` thành NULL, trong khi `'0'/'5'/'-1'` vẫn vào vì chúng là số. Contract `enforced: false`. Chưa test miền 1..4. Lọc *sau* `row_number()` sẽ đánh rơi cả ticket khi bản ghi mới nhất hỏng. |
+| **Ba nhóm `priority`** | (1) `'1'..'4'` → giữ integer. (2) `'urgent'→1, 'high'→2, 'medium'→3, 'low'→4` — schema evolution, *map không quarantine*. (3) `'0','5','-1','P1','unknown','',NULL` (312) → NULL → quarantine. |
+| **Cách khắc phục** | Macro `CASE` dùng chung Silver + quarantine. Lọc `priority_clean is not null` **trước** `row_number()`. `where normalize_priority(...) is null` ở quarantine. `contract.enforced: true` + test `not_null` + `accepted_values: [1,2,3,4]`. |
+| **Vì sao stack này (macro + contract + test + quarantine)** | **Macro** = một nguồn sự thật: Silver loại đúng những gì quarantine nhận, không lệch. **Contract** ràng *kiểu* (integer); một mình contract vẫn cho `priority=99` đi qua. **Test** ràng *miền* 1..4. **Quarantine / DLQ** tách 312 hàng lỗi (~2,2% CDC) để 12.480 ticket hợp lệ và toàn bộ event/chunk vẫn xuống Gold — pipeline không fail-fast. |
 
-Câu hỏi thiết kế: nên chặn ở tầng Bronze hay Silver? Vì sao **không** để pipeline dừng khi gặp bản ghi lỗi?
+**Evidence**
 
-> 1. **Nên chặn và kiểm tra ở tầng Silver, không chặn ở Bronze**: Tầng Bronze là hồ chứa dữ liệu thô (raw data lake / immutable log) với nhiệm vụ lưu trữ nguyên trạng mọi tín hiệu từ các nguồn gửi về. Nếu từ chối bản ghi lỗi ngay tại Bronze, dữ liệu gốc sẽ bị mất vĩnh viễn, vô hiệu hóa khả năng điều tra sự cố (Root Cause Analysis), audit, và không thể reprocess khi backend cung cấp bản sửa lỗi. Tầng Silver mới là nơi thực thi Data Contract, chuẩn hóa kiểu dữ liệu và làm sạch nghiệp vụ.
-> 2. **Vì sao không để pipeline dừng (fail fast)**: Trong môi trường thực tế, số lượng bản ghi lỗi (312 bản ghi) chỉ chiếm tỉ lệ rất nhỏ so với tổng khối lượng dữ liệu khổng lồ (hơn 14,300 bản ghi CDC và hơn 130,000 sự kiện). Nếu để pipeline dừng hoàn toàn, hàng trăm nghìn sự kiện và bản ghi hoàn toàn hợp lệ sẽ bị tắc nghẽn, làm sập downstream services (RAG search, CSKH dashboard, Routing agent), gây thiệt hại nghiêm trọng về SLA. Áp dụng mô hình **Quarantine (Dead-Letter Queue)** giúp cách ly dữ liệu lỗi sang bảng riêng cho kỹ sư xử lý sau, trong khi luồng dữ liệu hợp lệ vẫn được xử lý thông suốt.
+| Chỉ số | Trước | Sau | Ý nghĩa |
+|---|---|---|---|
+| `quarantine_tickets` | 0 | **312 / 312**, grain 1 hàng / 1 bản ghi CDC (0 key trùng) | Đúng nhóm 3, không nhầm nhóm 2 |
+| `silver_tickets` | priority bẩn, 6.606 hàng sai | **12.480** ticket; phân bố `1: 3.134 · 2: 3.029 · 3: 3.115 · 4: 3.202`; 0 NULL, 0 ngoài 1..4 | Loại *bản ghi* hỏng, không loại *ticket* |
+| `dbt test` | 9/9 (bản gốc) | **11/11** (thêm `not_null` + `accepted_values` trên `priority`) | Contract + miền giá trị |
+| `gold_training_set` | phụ thuộc Silver bẩn | vẫn **12.480**, không lặp | Downstream không mất entity |
+
+Nếu quarantine nhóm 2 như nhóm 3: bảng lỗi sẽ lên hàng nghìn hàng (rubric trừ điểm khi > 1.000) và mất dữ liệu hợp lệ chỉ vì backend đổi format.
+
+Câu hỏi thiết kế: nên chặn ở Bronze hay Silver? Vì sao không dừng pipeline?
+
+> 1. **Chặn ở Silver, không chặn ở Bronze.** Bronze là log thô bất biến. Từ chối ở Bronze là mất evidence, không audit được, không reprocess khi có mapper mới. Silver mới là nơi enforce contract.
+> 2. **Không fail-fast cả DAG.** 312 hàng lỗi / 14.300 CDC (~2,2%) không có quyền chặn 31.200 chunk RAG, ~130.000 event và dashboard CSKH. Quarantine = DLQ: luồng sạch chạy tiếp, người trực xử lý hàng bẩn sau.
 
 ---
 
-## 4 · *(mở rộng, không bắt buộc)* Bài trong EXTRA.md
+## 4 · *(mở rộng)* EXTRA.md — bài A và bài B
 
 | | |
 |---|---|
-| **Bài đã làm** | Cả hai bài: **Bài A** (Dashboard Compaction & Partitioning) và **Bài B** (Consumer Crash Recovery) |
-| **Nguyên nhân** | - **Bài A**: 5,000 file Parquet nhỏ (small-file problem) và không phân vùng khiến engine phải mở toàn bộ file; mệnh đề `WHERE strftime(event_time, '%Y-%m-%d') = '2026-08-09'` bọc hàm khiến engine không thể pruning theo partition hay row group stats.<br>- **Bài B**: Thứ tự commit offset trước khi ghi dữ liệu dẫn đến mất message khi tiến trình bị kill giữa batch (At-most-once); câu lệnh `INSERT` thuần không thể tự bảo vệ khi message được replay (thiếu tính Idempotent). |
-| **Cách khắc phục** | - **Bài A**: Viết `tools/compact.py` gom 5,000 file thành 14 file theo `PARTITION_BY (event_date)`, sắp xếp `ORDER BY event_date, customer_name, event_time`, đặt `ROW_GROUP_SIZE 1000`; viết lại `queries/dashboard.sql` dùng `hive_partitioning=1` và điều kiện lọc sargable `event_date = '2026-08-09'`.<br>- **Bài B**: Trong `ingest/consumer.py`, đảo thứ tự thành ghi dữ liệu trước (`write_batch`) rồi mới commit offset (`consumer.commit`); thêm khóa chính `event_id PRIMARY KEY` và thực hiện câu lệnh idempotent `INSERT INTO ... ON CONFLICT (event_id) DO UPDATE SET ...`. |
-| **Bằng chứng** | - **Bài A**: `rows scanned` giảm từ 5,000,000 xuống **9,324** (giảm **536.3×**, yêu cầu $\ge 10\times$); số files giảm từ 5,000 xuống **14**; `result hash` giữ nguyên: `4379e4c5d9f3`.<br>- **Bài B**: `make crash-test` vượt qua hoàn hảo: 0 mất hàng, 0 trùng hàng, $C == A = 20,000$ message $\rightarrow$ **BÀI MỞ RỘNG B: ĐẠT ✓**. |
+| **Bài đã làm** | Cả **A** (dashboard Parquet) và **B** (consumer crash) |
+
+### Bài A — small-file + partition pruning
+
+**Nguyên nhân.** 5.000 file Parquet nhỏ, không partition → engine mở hết file. `strftime(event_time, '%Y-%m-%d') = '...'` bọc cột trong hàm → không sargable, không dùng được Hive partition hay min/max row group.
+
+**Vì sao layout này, không phải index.** Parquet trên đĩa không có index. Ba đòn bẩy duy nhất: (1) **partition `event_date`** — query lọc một ngày; 14 giá trị = 14 thư mục. Partition theo `customer_name` (650 giá trị) sẽ tạo hàng trăm folder nhỏ, tái tạo small-file problem. (2) **`ORDER BY event_date, customer_name, event_time`** — hàng cùng khách nằm kề, min/max row group có ích khi lọc `customer_name='ACME'`. (3) **`ROW_GROUP_SIZE 1000`** — mặc định ~122.880 sẽ nhét cả ngày vào một row group, min/max `customer_name` phủ mọi khách, pruning chết. Query viết lại `event_date = '2026-08-09'` (cột đứng một mình) + `hive_partitioning=1`.
+
+**Evidence A** (`make explain` / dòng dashboard trong `make verify`)
+
+| Chỉ số | Baseline | Sau compact | Tiêu chí |
+|---|---|---|---|
+| rows scanned | 5.000.000 | **9.324** | giảm **536,3×** (≥ 10×) |
+| số file | 5.000 | **14** | hàng chục, đúng 14 ngày |
+| result hash | `4379e4c5d9f3` | `4379e4c5d9f3` | ngữ nghĩa query không đổi |
+
+### Bài B — at-least-once + idempotent write
+
+**Nguyên nhân.** Cũ: `commit()` → crash → `write_batch()`. Offset đã tiến, dữ liệu chưa ghi → **at-most-once = mất hàng**. `INSERT` thuần khi replay → trùng hàng.
+
+**Vì sao at-least-once + `ON CONFLICT DO UPDATE`, không phải exactly-once.** Exactly-once không có ở tầng transport. Chọn **ghi trước, commit offset sau** (at-least-once): crash tại `maybe_crash()` thì batch đã vào DuckDB, offset chưa dịch, restart đọc lại batch đó. Phải có ghi idempotent nếu không `INSERT` sẽ nhân bản.
+
+`event_id PRIMARY KEY` + `INSERT ... ON CONFLICT (event_id) DO UPDATE`: DuckDB chỉ cho `ON CONFLICT` khi có PK/UNIQUE.
+
+**`DO UPDATE` khác `DO NOTHING` khi message được replay với nội dung đã đổi:** `DO NOTHING` giữ bản cũ → consumer bỏ qua payload mới hơn (sai nếu producer retry bản sửa). `DO UPDATE` lấy `excluded.*` → hàng luôn là phiên bản mới nhất. Lab chọn `DO UPDATE` vì event/CDC có thể được gửi lại với field đã sửa (`latency_ms`, `event_type`, …).
+
+**Evidence B** (`make crash-test`, giết ở lô 7, batch 500, 20.000 message)
+
+| Lượt | Quan sát | Kết luận |
+|---|---|---|
+| A — chạy một mạch | 20.000 hàng / 20.000 `event_id` | baseline |
+| B — kill lô 7 | exit 137; **offset đã commit = 3.000** (không phải 3.500) | 6 lô đầu đã commit; lô 7 đã ghi nhưng *chưa* commit → đúng thứ tự ghi-trước |
+| C — restart | ghi thêm 17.000 (replay 500 + 16.500 còn lại); cuối **20.000 / 20.000** | replay không mất, không trùng |
+| Đối chiếu | `C == A`, lost = 0, dup = 0 | **BÀI MỞ RỘNG B: ĐẠT ✓** |
+
+Nếu vẫn commit trước khi ghi, offset sau crash sẽ là 3.500 và C thiếu 500 hàng.
 
 ---
 
 ## 5 · Tổng kết
 
-| Nhiệm vụ | Khi tiếp nhận một hệ thống chưa quen, tôi sẽ kiểm tra điều này trước tiên |
+| Nhiệm vụ | Khi tiếp nhận hệ thống chưa quen, kiểm tra điều này trước |
 |---|---|
-| 1 | Kiểm tra tính **Idempotent** của các model incremental (đã khai báo `unique_key` và `incremental_strategy` phù hợp chưa), và kiểm tra cấu hình scheduler DAG (`catchup=False`, `max_active_runs=1`) để tránh nhân bản dữ liệu khi chạy lại. |
-| 2 | Đo lường phân bố độ trễ dữ liệu (`_ingested_at - event_time`) qua các mốc **Percentile (P50, P95, P99)** để thiết lập **Lookback Window** chính xác cho late-arriving data, kết hợp khóa chính hợp lý để cập nhật lại dữ liệu cũ an toàn. |
-| 3 | Kiểm tra các ràng buộc **Data Contract** (`enforced: true`), bộ **Data Quality Tests**, và thiết lập cơ chế **Quarantine Table / Dead-Letter Queue** để cách ly bản ghi vi phạm schema mà không làm gián đoạn pipeline chính. |
+| 1 | Incremental đã có `unique_key` + strategy khớp *grain* chưa (entity → `merge`, partition aggregate → `delete+insert`)? Scheduler có `catchup=False`, `max_active_runs=1` không? Chạy lại N lần ra cùng checksum không? |
+| 2 | Đo P50/P95/**P99** của `_ingested_at - event_time` trước khi đặt lookback. Watermark `event_date > max(...)` bỏ late data. Nới window phải kèm unique key kẻo nhân bản. |
+| 3 | Contract *kiểu* + test *miền giá trị* + quarantine/DLQ. Macro dùng chung Silver và hàng lỗi. Lọc bản ghi hỏng trước khi lấy bản mới nhất của entity. |
