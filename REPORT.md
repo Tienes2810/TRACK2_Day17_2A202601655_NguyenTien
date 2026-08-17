@@ -1,6 +1,6 @@
 # Báo cáo LAB 17 — Data Pipeline Engineering
 
-**Họ tên:** Nguyễn Tiến  **Mã SV:** 2A202601655  **Lớp:** AICB-P2T2  **Ngày:** 2026-08-17
+**Họ tên:** Nguyễn Tiến  **Mã SV:** 2A202601655  **Lớp:** 2A  **Ngày:** 2026-08-17
 
 ---
 
