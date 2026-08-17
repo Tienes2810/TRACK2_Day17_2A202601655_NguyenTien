@@ -53,7 +53,7 @@ TABLE = "bronze_events_stream"
 
 DDL = f"""
 create table if not exists {TABLE} (
-    event_id      varchar,
+    event_id      varchar primary key,
     ticket_id     varchar,
     customer_id   varchar,
     customer_name varchar,
@@ -68,19 +68,40 @@ create table if not exists {TABLE} (
 def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
     """Ghi một lô message xuống kho — nhiệm vụ 5, hạng mục (b).
 
-    Câu lệnh hiện tại là INSERT thuần: ghi lại cùng một event_id sẽ tạo thêm
-    một hàng mới. Xem khung mã giả ở đầu file.
+    Sử dụng INSERT ON CONFLICT DO UPDATE để đảm bảo tính idempotent.
     """
-    con.executemany(
-        f"insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            (
-                r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
-                r["event_type"], r["latency_ms"], r["event_time"], r["_ingested_at"],
+    if not batch:
+        return
+    import json
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as tf:
+        tmp_path = tf.name
+        for r in batch:
+            tf.write(json.dumps(r) + "\n")
+
+    try:
+        tmp_str = tmp_path.replace("\\", "/")
+        con.execute(f"""
+            insert into {TABLE} (
+                event_id, ticket_id, customer_id, customer_name,
+                event_type, latency_ms, event_time, _ingested_at
             )
-            for r in batch
-        ],
-    )
+            select
+                event_id, ticket_id, customer_id, customer_name,
+                event_type, latency_ms, event_time, _ingested_at
+            from read_json_auto('{tmp_str}')
+            on conflict (event_id) do update set
+                ticket_id     = excluded.ticket_id,
+                customer_id   = excluded.customer_id,
+                customer_name = excluded.customer_name,
+                event_type    = excluded.event_type,
+                latency_ms    = excluded.latency_ms,
+                event_time    = excluded.event_time,
+                _ingested_at  = excluded._ingested_at
+        """)
+    finally:
+        pathlib.Path(tmp_path).unlink(missing_ok=True)
 
 
 def maybe_crash(batch_no: int, crash_at: int | None) -> None:
@@ -110,11 +131,10 @@ def consume(
             batch_no += 1
 
             # ── KHỐI CẦN XEM XÉT — nhiệm vụ 5, hạng mục (a) ───────────────
-            # Ba dòng dưới đây được phép sắp xếp lại. maybe_crash() mô phỏng
-            # `kill -9`: tiến trình chết ngay tại vị trí của nó, không rollback.
-            consumer.commit()                 # ghi nhận offset
-            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            # Ghi dữ liệu trước (at-least-once) + idempotent write
             write_batch(con, batch)           # ghi dữ liệu
+            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            consumer.commit()                 # ghi nhận offset
             # ─────────────────────────────────────────────────────────────
 
             written += len(batch)
